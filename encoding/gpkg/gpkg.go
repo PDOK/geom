@@ -114,15 +114,6 @@ const (
 	DataTypeTitles     = "titles"
 )
 
-// Extension describes a extension
-type Extension struct {
-	Tablename     string
-	Columnname    string
-	Extensionname string
-	Definition    string
-	Scope         string
-}
-
 // SpatialReferenceSystem describes the SRS
 type SpatialReferenceSystem struct {
 	Name                   string
