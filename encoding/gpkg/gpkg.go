@@ -1,16 +1,18 @@
+//go:build cgo
 // +build cgo
 
 package gpkg
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
 
 	"github.com/go-spatial/geom"
 	"github.com/go-spatial/geom/cmp"
-	_ "github.com/mattn/go-sqlite3"
+	"github.com/mattn/go-sqlite3"
 )
 
 const (
@@ -73,6 +75,18 @@ const (
 		CONSTRAINT fk_gc_srs FOREIGN KEY (srs_id) REFERENCES gpkg_spatial_ref_sys (srs_id)
 	  );
 	`
+
+	// https://www.geopackage.org/spec/#gpkg_extensions_sql
+	TableExtensionsSQL = `
+	CREATE TABLE IF NOT EXISTS gpkg_extensions (
+		table_name TEXT,
+		column_name TEXT,
+		extension_name TEXT NOT NULL,
+		definition TEXT NOT NULL,
+		scope TEXT NOT NULL,
+		CONSTRAINT ge_tce UNIQUE (table_name, column_name, extension_name)
+	  );
+	`
 )
 
 // Organization names
@@ -99,6 +113,15 @@ const (
 	DataTypeAttributes = "attributes"
 	DataTypeTitles     = "titles"
 )
+
+// Extension describes a extension
+type Extension struct {
+	Tablename     string
+	Columnname    string
+	Extensionname string
+	Definition    string
+	Scope         string
+}
 
 // SpatialReferenceSystem describes the SRS
 type SpatialReferenceSystem struct {
@@ -196,7 +219,44 @@ func nonZeroFileExists(filename string) bool {
 func Open(filename string) (*Handle, error) {
 	var h = new(Handle)
 
-	db, err := sql.Open(SQLITE3, filename)
+	// hotwired https://github.com/shaxbee/go-spatialite/blob/master/spatialite.go
+	type entrypoint struct {
+		lib  string
+		proc string
+	}
+
+	var LibNames = []entrypoint{
+		{"mod_spatialite", "sqlite3_modspatialite_init"},
+		{"mod_spatialite.dylib", "sqlite3_modspatialite_init"},
+		{"libspatialite.so", "sqlite3_modspatialite_init"},
+		{"libspatialite.so.5", "spatialite_init_ex"},
+		{"libspatialite.so", "spatialite_init_ex"},
+	}
+
+	var ErrSpatialiteNotFound = errors.New("shaxbee/go-spatialite: spatialite extension not found")
+
+	registered := false
+
+	for _, s := range sql.Drivers() {
+		if s == "spatialite" {
+			registered = true
+		}
+	}
+
+	if !registered {
+		sql.Register("spatialite", &sqlite3.SQLiteDriver{
+			ConnectHook: func(conn *sqlite3.SQLiteConn) error {
+				for _, v := range LibNames {
+					if err := conn.LoadExtension(v.lib, v.proc); err == nil {
+						return nil
+					}
+				}
+				return ErrSpatialiteNotFound
+			},
+		})
+	}
+
+	db, err := sql.Open("spatialite", filename)
 	if err != nil {
 		return nil, err
 	}
@@ -226,7 +286,7 @@ func initHandle(h *Handle) error {
 		return err
 	}
 	// Make sure the required metadata tables are available
-	for _, sql := range []string{TableSpatialRefSysSQL, TableContentsSQL, TableGeometryColumnsSQL} {
+	for _, sql := range []string{TableSpatialRefSysSQL, TableContentsSQL, TableGeometryColumnsSQL, TableExtensionsSQL} {
 		_, err := h.Exec(sql)
 		if err != nil {
 			return err
@@ -280,6 +340,106 @@ func (h *Handle) AddGeometryTable(table TableDescription) error {
 		VALUES(?,?,?,?,?,?)
     	ON CONFLICT(table_name) DO NOTHING;
 		`
+
+		updateExtensionTableSQL = `
+		INSERT INTO gpkg_extensions(
+			table_name,
+			column_name,
+			extension_name,
+			definition,
+			scope
+		)
+		VALUES(?,?,?,?,?)
+    	ON CONFLICT(table_name, column_name, extension_name) DO NOTHING;		
+		`
+
+		createRTreeTableSQL = `
+		CREATE VIRTUAL TABLE "rtree_%v_%v" USING rtree(id, minx, maxx, miny, maxy);
+		`
+
+		createInsertTriggerSQL = `
+		/* Conditions: Insertion of non-empty geometry
+		Actions   : Insert record into rtree */
+		CREATE TRIGGER rtree_%v_%v_insert AFTER INSERT ON "%v"
+		  WHEN (new."%v" NOT NULL AND NOT ST_IsEmpty(NEW."%v"))
+		BEGIN
+		  INSERT OR REPLACE INTO rtree_%v_%v VALUES (
+			 NEW."%v",
+			 ST_MinX(NEW."%v"), ST_MaxX(NEW."%v"),
+			 ST_MinY(NEW."%v"), ST_MaxY(NEW."%v")
+		  );
+		END;
+		`
+
+		createUpdate1TriggerSQL = `
+		/* Conditions: Update of geometry column to non-empty geometry
+						No row ID change
+			Actions   : Update record in rtree */
+		CREATE TRIGGER rtree_%v_%v_update1 AFTER UPDATE OF "%v" ON "%v"
+		  WHEN OLD."%v" = NEW."%v" AND
+				(NEW."%v" NOTNULL AND NOT ST_IsEmpty(NEW."%v"))
+		BEGIN
+		  INSERT OR REPLACE INTO rtree_%v_%v VALUES (
+			 NEW."%v",
+			 ST_MinX(NEW."%v"), ST_MaxX(NEW."%v"),
+			 ST_MinY(NEW."%v"), ST_MaxY(NEW."%v")
+		  );
+		END;
+		`
+
+		createUpdate2TriggerSQL = `
+		/* Conditions: Update of geometry column to empty geometry
+						No row ID change
+			Actions   : Remove record from rtree */
+		CREATE TRIGGER rtree_%v_%v_update2 AFTER UPDATE OF "%v" ON "%v"
+		  WHEN OLD."%v" = NEW."%v" AND
+				(NEW."%v" ISNULL OR ST_IsEmpty(NEW."%v"))
+		BEGIN
+		  DELETE FROM rtree_%v_%v WHERE id = OLD."%v";
+		END;
+		`
+
+		createUpdate3TriggerSQL = `
+		/* Conditions: Update of any column
+						Row ID change
+						Non-empty geometry
+			Actions   : Remove record from rtree for old <i>
+						Insert record into rtree for new <i> */
+		CREATE TRIGGER rtree_%v_%v_update3 AFTER UPDATE ON "%v"
+		  WHEN OLD."%v" != NEW."%v" AND
+				(NEW."%v" NOTNULL AND NOT ST_IsEmpty(NEW."%v"))
+		BEGIN
+		  DELETE FROM rtree_%v_%v WHERE id = OLD."%v";
+		  INSERT OR REPLACE INTO rtree_%v_%v VALUES (
+			 NEW."%v",
+			 ST_MinX(NEW."%v"), ST_MaxX(NEW."%v"),
+			 ST_MinY(NEW."%v"), ST_MaxY(NEW."%v")
+		  );
+		END;
+		`
+
+		createUpdate4TriggerSQL = `
+		/* Conditions: Update of any column
+						Row ID change
+						Empty geometry
+			Actions   : Remove record from rtree for old and new <i> */
+		CREATE TRIGGER rtree_%v_%v_update4 AFTER UPDATE ON "%v"
+		  WHEN OLD."%v" != NEW."%v" AND
+				(NEW."%v" ISNULL OR ST_IsEmpty(NEW."%v"))
+		BEGIN
+		  DELETE FROM rtree_%v_%v WHERE id IN (OLD."%v", NEW."%v");
+		END;
+		`
+
+		createDeleteTriggerSQL = `
+		/* Conditions: Row deleted
+		   Actions   : Remove record from rtree for old <i> */
+		CREATE TRIGGER rtree_%v_%v_delete AFTER DELETE ON "%v"
+		  WHEN old."%v" NOT NULL
+		BEGIN
+		  DELETE FROM rtree_%v_%v WHERE id = OLD."%v";
+		END;
+		`
 	)
 
 	var (
@@ -311,6 +471,86 @@ func (h *Handle) AddGeometryTable(table TableDescription) error {
 		return err
 	}
 	_, err = h.Exec(updateGeometryColumnsTableSQL, table.Name, table.GeometryField, table.GeometryType.String(), table.SRS, table.Z, table.M)
+	if err != nil {
+		return err
+	}
+
+	_, err = h.Exec(fmt.Sprintf(createRTreeTableSQL,
+		table.Name, table.GeometryField,
+	))
+	if err != nil {
+		return err
+	}
+
+	_, err = h.Exec(fmt.Sprintf(createInsertTriggerSQL,
+		table.Name, table.GeometryField, table.Name,
+		table.GeometryField, table.GeometryField,
+		table.Name, table.GeometryField,
+		`fid`,
+		table.GeometryField, table.GeometryField,
+		table.GeometryField, table.GeometryField,
+	))
+	if err != nil {
+		return err
+	}
+
+	_, err = h.Exec(fmt.Sprintf(createUpdate1TriggerSQL,
+		table.Name, table.GeometryField, table.GeometryField, table.Name,
+		`fid`, `fid`,
+		table.GeometryField, table.GeometryField,
+		table.Name, table.GeometryField,
+		`fid`,
+		table.GeometryField, table.GeometryField,
+		table.GeometryField, table.GeometryField,
+	))
+	if err != nil {
+		return err
+	}
+
+	_, err = h.Exec(fmt.Sprintf(createUpdate2TriggerSQL,
+		table.Name, table.GeometryField, table.GeometryField, table.Name,
+		`fid`, `fid`,
+		table.GeometryField, table.GeometryField,
+		table.Name, table.GeometryField, `fid`,
+	))
+	if err != nil {
+		return err
+	}
+
+	_, err = h.Exec(fmt.Sprintf(createUpdate3TriggerSQL,
+		table.Name, table.GeometryField, table.Name,
+		`fid`, `fid`,
+		table.GeometryField, table.GeometryField,
+		table.Name, table.GeometryField, `fid`,
+		table.Name, table.GeometryField,
+		`fid`,
+		table.GeometryField, table.GeometryField,
+		table.GeometryField, table.GeometryField,
+	))
+	if err != nil {
+		return err
+	}
+
+	_, err = h.Exec(fmt.Sprintf(createUpdate4TriggerSQL,
+		table.Name, table.GeometryField, table.Name,
+		`fid`, `fid`,
+		table.GeometryField, table.GeometryField,
+		table.Name, table.GeometryField, `fid`, `fid`,
+	))
+	if err != nil {
+		return err
+	}
+
+	_, err = h.Exec(fmt.Sprintf(createDeleteTriggerSQL,
+		table.Name, table.GeometryField, table.Name,
+		table.GeometryField,
+		table.Name, table.GeometryField, `fid`,
+	))
+	if err != nil {
+		return err
+	}
+
+	_, err = h.Exec(updateExtensionTableSQL, table.Name, table.GeometryField, `gpkg_rtree_index`, `http://www.geopackage.org/spec120/#extension_rtree`, `write-only`)
 	return err
 
 }
