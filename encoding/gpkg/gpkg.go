@@ -16,8 +16,8 @@ import (
 )
 
 const (
-	// SQLITE3 is the database driver name
-	SQLITE3 = "sqlite3"
+	// SPATIALITE database driver name
+	SPATIALITE = "spatialite"
 
 	// ApplicationID is the required application id for the file
 	ApplicationID = 0x47504B47 // "GPKG"
@@ -206,17 +206,15 @@ func nonZeroFileExists(filename string) bool {
 	return info.Size() > 0
 }
 
-// Open will open or create the sqlite file, and return a new db handle to it.
-func Open(filename string) (*Handle, error) {
-	var h = new(Handle)
-
-	// hotwired https://github.com/shaxbee/go-spatialite/blob/master/spatialite.go
+// Return spatialite drivename while loading the required libs
+func drivername() string {
+	// quick hotwired of https://github.com/shaxbee/go-spatialite/blob/master/spatialite.go
 	type entrypoint struct {
 		lib  string
 		proc string
 	}
 
-	var LibNames = []entrypoint{
+	var libs = []entrypoint{
 		{"mod_spatialite", "sqlite3_modspatialite_init"},
 		{"mod_spatialite.dylib", "sqlite3_modspatialite_init"},
 		{"libspatialite.so", "sqlite3_modspatialite_init"},
@@ -224,30 +222,32 @@ func Open(filename string) (*Handle, error) {
 		{"libspatialite.so", "spatialite_init_ex"},
 	}
 
-	var ErrSpatialiteNotFound = errors.New("shaxbee/go-spatialite: spatialite extension not found")
-
-	registered := false
-
 	for _, s := range sql.Drivers() {
-		if s == "spatialite" {
-			registered = true
+		if s == SPATIALITE {
+			return SPATIALITE
 		}
 	}
 
-	if !registered {
-		sql.Register("spatialite", &sqlite3.SQLiteDriver{
-			ConnectHook: func(conn *sqlite3.SQLiteConn) error {
-				for _, v := range LibNames {
-					if err := conn.LoadExtension(v.lib, v.proc); err == nil {
-						return nil
-					}
+	sql.Register(SPATIALITE, &sqlite3.SQLiteDriver{
+		ConnectHook: func(conn *sqlite3.SQLiteConn) error {
+			for _, v := range libs {
+				if err := conn.LoadExtension(v.lib, v.proc); err == nil {
+					return nil
 				}
-				return ErrSpatialiteNotFound
-			},
-		})
-	}
+			}
+			return errors.New("spatialite extension not found")
+		},
+	})
 
-	db, err := sql.Open("spatialite", filename)
+	return SPATIALITE
+
+}
+
+// Open will open or create the sqlite file, and return a new db handle to it.
+func Open(filename string) (*Handle, error) {
+	var h = new(Handle)
+
+	db, err := sql.Open(drivername(), filename)
 	if err != nil {
 		return nil, err
 	}
