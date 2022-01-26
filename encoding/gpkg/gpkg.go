@@ -4,11 +4,13 @@
 package gpkg
 
 import (
+	"bytes"
 	"database/sql"
 	"errors"
 	"fmt"
 	"os"
 	"strings"
+	"text/template"
 
 	"github.com/go-spatial/geom"
 	"github.com/go-spatial/geom/cmp"
@@ -344,97 +346,93 @@ func (h *Handle) AddGeometryTable(table TableDescription) error {
     	ON CONFLICT(table_name, column_name, extension_name) DO NOTHING;		
 		`
 
+		// DDL and DML for the RTree -> http://www.geopackage.org/spec120/#extension_rtree
+		// SQL statements based on the requeriments as of spec 1.2.0
+
 		createRTreeTableSQL = `
 		CREATE VIRTUAL TABLE "rtree_%v_%v" USING rtree(id, minx, maxx, miny, maxy);
 		`
 
-		createInsertTriggerSQL = `
-		/* Conditions: Insertion of non-empty geometry
-		Actions   : Insert record into rtree */
-		CREATE TRIGGER rtree_%v_%v_insert AFTER INSERT ON "%v"
-		  WHEN (new."%v" NOT NULL AND NOT ST_IsEmpty(NEW."%v"))
-		BEGIN
-		  INSERT OR REPLACE INTO rtree_%v_%v VALUES (
-			 NEW."%v",
-			 ST_MinX(NEW."%v"), ST_MaxX(NEW."%v"),
-			 ST_MinY(NEW."%v"), ST_MaxY(NEW."%v")
-		  );
-		END;
-		`
+		selectPKfromTable = `SELECT name FROM pragma_table_info(("%v")) WHERE pk = 1;`
 
-		createUpdate1TriggerSQL = `
-		/* Conditions: Update of geometry column to non-empty geometry
-						No row ID change
-			Actions   : Update record in rtree */
-		CREATE TRIGGER rtree_%v_%v_update1 AFTER UPDATE OF "%v" ON "%v"
-		  WHEN OLD."%v" = NEW."%v" AND
-				(NEW."%v" NOTNULL AND NOT ST_IsEmpty(NEW."%v"))
-		BEGIN
-		  INSERT OR REPLACE INTO rtree_%v_%v VALUES (
-			 NEW."%v",
-			 ST_MinX(NEW."%v"), ST_MaxX(NEW."%v"),
-			 ST_MinY(NEW."%v"), ST_MaxY(NEW."%v")
-		  );
-		END;
-		`
-
-		createUpdate2TriggerSQL = `
-		/* Conditions: Update of geometry column to empty geometry
-						No row ID change
-			Actions   : Remove record from rtree */
-		CREATE TRIGGER rtree_%v_%v_update2 AFTER UPDATE OF "%v" ON "%v"
-		  WHEN OLD."%v" = NEW."%v" AND
-				(NEW."%v" ISNULL OR ST_IsEmpty(NEW."%v"))
-		BEGIN
-		  DELETE FROM rtree_%v_%v WHERE id = OLD."%v";
-		END;
-		`
-
-		createUpdate3TriggerSQL = `
-		/* Conditions: Update of any column
-						Row ID change
-						Non-empty geometry
-			Actions   : Remove record from rtree for old <i>
-						Insert record into rtree for new <i> */
-		CREATE TRIGGER rtree_%v_%v_update3 AFTER UPDATE ON "%v"
-		  WHEN OLD."%v" != NEW."%v" AND
-				(NEW."%v" NOTNULL AND NOT ST_IsEmpty(NEW."%v"))
-		BEGIN
-		  DELETE FROM rtree_%v_%v WHERE id = OLD."%v";
-		  INSERT OR REPLACE INTO rtree_%v_%v VALUES (
-			 NEW."%v",
-			 ST_MinX(NEW."%v"), ST_MaxX(NEW."%v"),
-			 ST_MinY(NEW."%v"), ST_MaxY(NEW."%v")
-		  );
-		END;
-		`
-
-		createUpdate4TriggerSQL = `
-		/* Conditions: Update of any column
-						Row ID change
-						Empty geometry
-			Actions   : Remove record from rtree for old and new <i> */
-		CREATE TRIGGER rtree_%v_%v_update4 AFTER UPDATE ON "%v"
-		  WHEN OLD."%v" != NEW."%v" AND
-				(NEW."%v" ISNULL OR ST_IsEmpty(NEW."%v"))
-		BEGIN
-		  DELETE FROM rtree_%v_%v WHERE id IN (OLD."%v", NEW."%v");
-		END;
-		`
-
-		createDeleteTriggerSQL = `
-		/* Conditions: Row deleted
-		   Actions   : Remove record from rtree for old <i> */
-		CREATE TRIGGER rtree_%v_%v_delete AFTER DELETE ON "%v"
-		  WHEN old."%v" NOT NULL
-		BEGIN
-		  DELETE FROM rtree_%v_%v WHERE id = OLD."%v";
-		END;
+		tableTriggerTemplate = `
+        /* Conditions: Insertion of non-empty geometry
+           Actions   : Insert record into rtree */
+        CREATE TRIGGER rtree_{{ .T }}_{{ .C }}_insert AFTER INSERT ON "{{ .T }}"
+          WHEN (new."{{ .C }}" NOT NULL AND NOT ST_IsEmpty(NEW."{{ .C }}"))
+        BEGIN
+          INSERT OR REPLACE INTO rtree_{{ .T }}_{{ .C }} VALUES (
+            NEW."{{ .I }}",
+            ST_MinX(NEW."{{ .C }}"), ST_MaxX(NEW."{{ .C }}"),
+            ST_MinY(NEW."{{ .C }}"), ST_MaxY(NEW."{{ .C }}")
+          );
+        END;
+        
+        /* Conditions: Update of geometry column to non-empty geometry
+                       No row ID change
+           Actions   : Update record in rtree */
+        CREATE TRIGGER rtree_{{ .T }}_{{ .C }}_update1 AFTER UPDATE OF "{{ .C }}" ON "{{ .T }}"
+          WHEN OLD."{{ .I }}" = NEW."{{ .I }}" AND
+               (NEW."{{ .C }}" NOTNULL AND NOT ST_IsEmpty(NEW."{{ .C }}"))
+        BEGIN
+          INSERT OR REPLACE INTO rtree_{{ .T }}_{{ .C }} VALUES (
+            NEW."{{ .I }}",
+            ST_MinX(NEW."{{ .C }}"), ST_MaxX(NEW."{{ .C }}"),
+            ST_MinY(NEW."{{ .C }}"), ST_MaxY(NEW."{{ .C }}")
+          );
+        END;
+        
+        /* Conditions: Update of geometry column to empty geometry
+                       No row ID change
+           Actions   : Remove record from rtree */
+        CREATE TRIGGER rtree_{{ .T }}_{{ .C }}_update2 AFTER UPDATE OF "{{ .C }}" ON "{{ .T }}"
+          WHEN OLD."{{ .I }}" = NEW."{{ .I }}" AND
+               (NEW."{{ .C }}" ISNULL OR ST_IsEmpty(NEW."{{ .C }}"))
+        BEGIN
+          DELETE FROM rtree_{{ .T }}_{{ .C }} WHERE id = OLD."{{ .I }}";
+        END;
+        
+        /* Conditions: Update of any column
+                       Row ID change
+                       Non-empty geometry
+           Actions   : Remove record from rtree for old "{{ .I }}"
+                       Insert record into rtree for new "{{ .I }}" */
+        CREATE TRIGGER rtree_{{ .T }}_{{ .C }}_update3 AFTER UPDATE OF "{{ .C }}" ON "{{ .T }}"
+          WHEN OLD."{{ .I }}" != NEW."{{ .I }}" AND
+               (NEW."{{ .C }}" NOTNULL AND NOT ST_IsEmpty(NEW."{{ .C }}"))
+        BEGIN
+          DELETE FROM rtree_{{ .T }}_{{ .C }} WHERE id = OLD."{{ .I }}";
+          INSERT OR REPLACE INTO rtree_{{ .T }}_{{ .C }} VALUES (
+            NEW."{{ .I }}",
+            ST_MinX(NEW."{{ .C }}"), ST_MaxX(NEW."{{ .C }}"),
+            ST_MinY(NEW."{{ .C }}"), ST_MaxY(NEW."{{ .C }}")
+          );
+        END;
+        
+        /* Conditions: Update of any column
+                       Row ID change
+                       Empty geometry
+           Actions   : Remove record from rtree for old and new "{{ .I }}" */
+        CREATE TRIGGER rtree_{{ .T }}_{{ .C }}_update4 AFTER UPDATE ON "{{ .T }}"
+          WHEN OLD."{{ .I }}" != NEW."{{ .I }}" AND
+               (NEW."{{ .C }}" ISNULL OR ST_IsEmpty(NEW."{{ .C }}"))
+        BEGIN
+          DELETE FROM rtree_{{ .T }}_{{ .C }} WHERE id IN (OLD."{{ .I }}", NEW."{{ .I }}");
+        END;
+        
+        /* Conditions: Row deleted
+           Actions   : Remove record from rtree for old "{{ .I }}" */
+        CREATE TRIGGER rtree_{{ .T }}_{{ .C }}_delete AFTER DELETE ON "{{ .T }}"
+          WHEN old."{{ .C }}" NOT NULL
+        BEGIN
+          DELETE FROM rtree_{{ .T }}_{{ .C }} WHERE id = OLD."{{ .I }}";
+        END;
 		`
 	)
 
 	var (
 		count int
+		pk    string
 	)
 
 	// Validate that the value already exists in the data base.
@@ -466,77 +464,31 @@ func (h *Handle) AddGeometryTable(table TableDescription) error {
 		return err
 	}
 
+	err = h.QueryRow(fmt.Sprintf(selectPKfromTable, table.Name)).Scan(&pk)
+	if err != nil {
+		return err
+	}
+
+	// Requirement 77
+	type tableTriggerParameters struct {
+		T string // <t>: The name of the feature table containing the geometry column
+		C string // <c>: The name of the geometry column in <t> that is being indexed
+		I string // <i>: The name of the integer primary key column in <t> as specified in Requirement 29
+	}
+
+	param := tableTriggerParameters{T: table.Name, C: table.GeometryField, I: pk}
+
 	_, err = h.Exec(fmt.Sprintf(createRTreeTableSQL,
-		table.Name, table.GeometryField,
+		param.T, param.C,
 	))
 	if err != nil {
 		return err
 	}
 
-	_, err = h.Exec(fmt.Sprintf(createInsertTriggerSQL,
-		table.Name, table.GeometryField, table.Name,
-		table.GeometryField, table.GeometryField,
-		table.Name, table.GeometryField,
-		`fid`,
-		table.GeometryField, table.GeometryField,
-		table.GeometryField, table.GeometryField,
-	))
-	if err != nil {
-		return err
-	}
+	buf := new(bytes.Buffer)
+	template.Must(template.New("createtabletriggers").Parse(tableTriggerTemplate)).Execute(buf, param)
 
-	_, err = h.Exec(fmt.Sprintf(createUpdate1TriggerSQL,
-		table.Name, table.GeometryField, table.GeometryField, table.Name,
-		`fid`, `fid`,
-		table.GeometryField, table.GeometryField,
-		table.Name, table.GeometryField,
-		`fid`,
-		table.GeometryField, table.GeometryField,
-		table.GeometryField, table.GeometryField,
-	))
-	if err != nil {
-		return err
-	}
-
-	_, err = h.Exec(fmt.Sprintf(createUpdate2TriggerSQL,
-		table.Name, table.GeometryField, table.GeometryField, table.Name,
-		`fid`, `fid`,
-		table.GeometryField, table.GeometryField,
-		table.Name, table.GeometryField, `fid`,
-	))
-	if err != nil {
-		return err
-	}
-
-	_, err = h.Exec(fmt.Sprintf(createUpdate3TriggerSQL,
-		table.Name, table.GeometryField, table.Name,
-		`fid`, `fid`,
-		table.GeometryField, table.GeometryField,
-		table.Name, table.GeometryField, `fid`,
-		table.Name, table.GeometryField,
-		`fid`,
-		table.GeometryField, table.GeometryField,
-		table.GeometryField, table.GeometryField,
-	))
-	if err != nil {
-		return err
-	}
-
-	_, err = h.Exec(fmt.Sprintf(createUpdate4TriggerSQL,
-		table.Name, table.GeometryField, table.Name,
-		`fid`, `fid`,
-		table.GeometryField, table.GeometryField,
-		table.Name, table.GeometryField, `fid`, `fid`,
-	))
-	if err != nil {
-		return err
-	}
-
-	_, err = h.Exec(fmt.Sprintf(createDeleteTriggerSQL,
-		table.Name, table.GeometryField, table.Name,
-		table.GeometryField,
-		table.Name, table.GeometryField, `fid`,
-	))
+	_, err = h.Exec(buf.String())
 	if err != nil {
 		return err
 	}
